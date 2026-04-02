@@ -1,99 +1,226 @@
-import os
-import cv2
+import tarfile
+import shutil
+import random
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
+
+import cv2
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split
 from clearml import Task, Dataset
 
-# --- НАСТРОЙКИ ---
-SOURCE_PROJECT = "datasets"
-SOURCE_NAME = "FloorPlanDataset"
+
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
+ARCHIVE_NAME = "train-00.tar.xz"   # архив лежит рядом со скриптом
+
 TARGET_PROJECT = "FloorPlan_Restoration"
-TARGET_NAME = "FloorPlan_Processed_v2"
+TARGET_DATASET_NAME = "FloorPlan_Ready_For_Training_v1"
 
-# Параметры обработки
-IMG_SIZE = (512, 512)   # Размер для обучения
-BLUR_KERNEL = (15, 15)  # Степень нечеткости (чем больше числа, тем сильнее размытие)
-TEST_SIZE = 0.2
-JPG_QUALITY = 85        # Качество JPG для LQ (добавляет легкие артефакты сжатия)
+IMG_SIZE = (512, 512)          # единый размер
+BLUR_KERNEL = (15, 15)         # размытие для LQ
+TEST_RATIO = 0.2               # 80/20
+JPG_QUALITY = 85               # артефакты JPEG для LQ
+SEED = 42
 
-def check_dataset_exists(project, name):
-    datasets = Dataset.list_datasets(
-        dataset_project=project,
-        dataset_name=name,
-        only_completed=True
+# Временные/итоговые папки
+EXTRACT_DIR_NAME = "extracted_data"
+OUTPUT_DIR_NAME = "dataset_ready_for_training"
+
+
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================================================
+def safe_rmtree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def collect_image_files(root: Path):
+    valid_ext = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    return [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in valid_ext
+    ]
+
+
+def ensure_structure(output_dir: Path) -> None:
+    for split in ["train", "test"]:
+        (output_dir / split / "HQ").mkdir(parents=True, exist_ok=True)
+        (output_dir / split / "LQ").mkdir(parents=True, exist_ok=True)
+
+
+def make_unique_name(file_path: Path) -> str:
+    # Чтобы не было конфликтов имён при одинаковых stem в разных папках
+    rel = str(file_path).replace("\\", "_").replace("/", "_")
+    stem = Path(rel).stem
+    return stem
+
+
+def process_one(job):
+    """
+    job = (file_path_str, split, output_dir_str, img_size, blur_kernel, jpg_quality)
+    """
+    file_path_str, split, output_dir_str, img_size, blur_kernel, jpg_quality = job
+
+    file_path = Path(file_path_str)
+    output_dir = Path(output_dir_str)
+
+    img = cv2.imread(str(file_path))
+    if img is None:
+        return {"ok": False, "file": file_path_str, "reason": "cv2.imread returned None"}
+
+    # HQ = resize
+    hq = cv2.resize(img, img_size, interpolation=cv2.INTER_AREA)
+
+    # LQ = blur
+    lq = cv2.GaussianBlur(hq, blur_kernel, 0)
+
+    # Дополнительные jpeg-артефакты
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        lq,
+        [int(cv2.IMWRITE_JPEG_QUALITY), jpg_quality]
     )
-    return len(datasets) > 0
+    if not ok:
+        return {"ok": False, "file": file_path_str, "reason": "cv2.imencode failed"}
 
-# 1. Инициализация задачи
-task = Task.init(
-    project_name=TARGET_PROJECT, 
-    task_name="Dataset_HQ_PNG_LQ_JPG",
-    task_type=Task.TaskTypes.data_processing
-)
+    lq = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if lq is None:
+        return {"ok": False, "file": file_path_str, "reason": "cv2.imdecode failed"}
 
-# 2. Проверка исходного датасета
-print(f"Ищем датасет {SOURCE_NAME}...")
-if not check_dataset_exists(SOURCE_PROJECT, SOURCE_NAME):
-    print(f"ОШИБКА: Исходный датасет '{SOURCE_NAME}' в проекте '{SOURCE_PROJECT}' не найден.")
-    task.close()
-    exit(1)
+    base_name = make_unique_name(file_path)
 
-# 3. Получение данных
-input_dataset = Dataset.get(dataset_project=SOURCE_PROJECT, dataset_name=SOURCE_NAME)
-input_path = Path(input_dataset.get_local_copy())
+    hq_out = output_dir / split / "HQ" / f"{base_name}.png"
+    lq_out = output_dir / split / "LQ" / f"{base_name}.jpg"
 
-# Собираем файлы
-all_files = [f for f in input_path.rglob('*') if f.suffix.lower() in ('.png', '.jpg', '.jpeg')]
-print(f"Найдено файлов: {len(all_files)}")
+    ok_hq = cv2.imwrite(str(hq_out), hq)
+    ok_lq = cv2.imwrite(str(lq_out), lq)
 
-# Разделение на выборки
-train_files, test_files = train_test_split(all_files, test_size=TEST_SIZE, random_state=42)
+    if not ok_hq or not ok_lq:
+        return {"ok": False, "file": file_path_str, "reason": "cv2.imwrite failed"}
 
-# 4. Обработка
-temp_dir = Path("./processed_data_temp")
+    return {"ok": True, "file": file_path_str}
 
-for split, files in [("train", train_files), ("test", test_files)]:
-    print(f"Обработка {split}...")
-    
-    # Создаем папки
-    hq_path = temp_dir / split / "HQ"
-    lq_path = temp_dir / split / "LQ"
-    hq_path.mkdir(parents=True, exist_ok=True)
-    lq_path.mkdir(parents=True, exist_ok=True)
 
-    for file_path in tqdm(files):
-        img = cv2.imread(str(file_path))
-        if img is None:
-            continue
-        
-        # 1. Ресайз (базовая обработка)
-        hq = cv2.resize(img, IMG_SIZE, interpolation=cv2.INTER_AREA)
-        
-        # 2. Создание нечеткого изображения (только блюр, без шума)
-        lq = cv2.GaussianBlur(hq, BLUR_KERNEL, 0)
-        
-        # 3. Сохранение HQ в PNG
-        base_name = file_path.stem
-        cv2.imwrite(str(hq_path / f"{base_name}.png"), hq)
-        
-        # 4. Сохранение LQ в JPG (нечеткое)
-        cv2.imwrite(
-            str(lq_path / f"{base_name}.jpg"), 
-            lq, 
-            [int(cv2.IMWRITE_JPEG_QUALITY), JPG_QUALITY]
+# =========================================================
+# ОСНОВНОЙ КОД
+# =========================================================
+def main():
+    # 1. Init ClearML task
+    task = Task.init(
+        project_name=TARGET_PROJECT,
+        task_name="Prepare_FloorPlan_Ready_For_Training_Local",
+        task_type=Task.TaskTypes.data_processing,
+        reuse_last_task_id=False
+    )
+
+    script_dir = Path(__file__).resolve().parent
+    archive_path = script_dir / ARCHIVE_NAME
+    extract_dir = script_dir / EXTRACT_DIR_NAME
+    output_dir = script_dir / OUTPUT_DIR_NAME
+
+    print(f"Рабочая папка: {script_dir}")
+    print(f"Архив: {archive_path}")
+
+    if not archive_path.exists():
+        raise FileNotFoundError(
+            f"Не найден архив '{ARCHIVE_NAME}' рядом со скриптом: {archive_path}"
         )
 
-# 5. Создание нового датасета в ClearML
-print("Регистрация нового датасета в ClearML...")
-new_ds = Dataset.create(
-    dataset_project=TARGET_PROJECT,
-    dataset_name=TARGET_NAME,
-    parent_datasets=[input_dataset.id]
-)
+    # 2. Очистка старых папок
+    print("Шаг 1: очистка временных папок...")
+    safe_rmtree(extract_dir)
+    safe_rmtree(output_dir)
 
-new_ds.add_files(path=str(temp_dir))
-new_ds.upload()
-new_ds.finalize()
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_structure(output_dir)
 
-print(f"Готово! ID нового датасета: {new_ds.id}")
+    # 3. Распаковка
+    print(f"Шаг 2: распаковка архива {ARCHIVE_NAME}...")
+    with tarfile.open(archive_path, "r:xz") as tar:
+        tar.extractall(path=extract_dir)
+
+    # 4. Сбор изображений
+    print("Шаг 3: поиск изображений...")
+    all_files = collect_image_files(extract_dir)
+    print(f"Найдено изображений: {len(all_files)}")
+
+    if not all_files:
+        raise RuntimeError("После распаковки изображения не найдены")
+
+    # 5. Train/Test split
+    print("Шаг 4: train/test split...")
+    random.seed(SEED)
+    random.shuffle(all_files)
+
+    split_idx = int(len(all_files) * (1 - TEST_RATIO))
+    train_files = all_files[:split_idx]
+    test_files = all_files[split_idx:]
+
+    print(f"Train: {len(train_files)}")
+    print(f"Test:  {len(test_files)}")
+
+    # 6. Подготовка jobs
+    print("Шаг 5: генерация HQ/LQ...")
+    jobs = []
+    for p in train_files:
+        jobs.append((str(p), "train", str(output_dir), IMG_SIZE, BLUR_KERNEL, JPG_QUALITY))
+    for p in test_files:
+        jobs.append((str(p), "test", str(output_dir), IMG_SIZE, BLUR_KERNEL, JPG_QUALITY))
+
+    workers = max(1, cpu_count() - 1)
+    print(f"Используем процессов: {workers}")
+
+    success_count = 0
+    failed = []
+
+    with Pool(processes=workers) as pool:
+        for result in tqdm(pool.imap_unordered(process_one, jobs, chunksize=32), total=len(jobs)):
+            if result["ok"]:
+                success_count += 1
+            else:
+                failed.append(result)
+
+    print(f"Успешно обработано: {success_count}")
+    print(f"Ошибок: {len(failed)}")
+
+    if failed:
+        print("Примеры ошибок:")
+        for item in failed[:10]:
+            print(item)
+
+    # 7. Логируем параметры в ClearML
+    task.connect({
+        "archive_name": ARCHIVE_NAME,
+        "target_project": TARGET_PROJECT,
+        "target_dataset_name": TARGET_DATASET_NAME,
+        "img_size": IMG_SIZE,
+        "blur_kernel": BLUR_KERNEL,
+        "test_ratio": TEST_RATIO,
+        "jpg_quality": JPG_QUALITY,
+        "seed": SEED,
+        "processed_ok": success_count,
+        "processed_failed": len(failed),
+    })
+
+    # 8. Загрузка в ClearML Dataset
+    print("Шаг 6: регистрация итогового датасета в ClearML...")
+    ds = Dataset.create(
+        dataset_project=TARGET_PROJECT,
+        dataset_name=TARGET_DATASET_NAME
+    )
+
+    ds.add_files(path=str(output_dir))
+    ds.upload()
+    ds.finalize()
+
+    print("✅ Готово!")
+    print(f"Dataset ID: {ds.id}")
+    print(f"Структура датасета: {output_dir}")
+    print("Дальше его можно напрямую использовать в PyTorch Dataset/DataLoader.")
+
+
+if __name__ == "__main__":
+    main()
