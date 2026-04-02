@@ -12,7 +12,7 @@ from clearml import Task, Dataset
 # =========================================================
 # НАСТРОЙКИ
 # =========================================================
-ARCHIVE_NAME = "train-00.tar.xz"   # архив лежит рядом со скриптом
+ARCHIVE_NAME = "D:\Projects\ClearML\Data-science-and-ML\Tutorials\ClearML\train-00.tar.xz"   # архив лежит рядом со скриптом
 
 TARGET_PROJECT = "FloorPlan_Restoration"
 TARGET_DATASET_NAME = "FloorPlan_Ready_For_Training_v1"
