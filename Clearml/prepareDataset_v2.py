@@ -18,7 +18,7 @@ task = Task.init(
 task.set_packages([
     "clearml==1.18.0",
     "torch==2.3.1",
-    "opencv-python==4.13.0.92",
+    "opencv-python-headless==4.10.0.84",
     "tqdm==4.67.3",
     "numpy==1.26.4"
 ])
