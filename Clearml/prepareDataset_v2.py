@@ -20,7 +20,7 @@ task.set_packages([
     "torch==2.3.1",
     "opencv-python==4.13.0.92",
     "tqdm==4.67.3",
-    "numpy"
+    "numpy==1.26.4"
 ])
 
 # Отправляем задачу на агент
